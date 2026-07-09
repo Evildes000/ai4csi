@@ -14,15 +14,18 @@ TX2 → RX: Non-Line-of-Sight (NLOS) — reflected paths only (Rayleigh-like)
 
 import numpy as np
 import matplotlib.pyplot as plt
-
+import scienceplots
 # ==================== Parameters ====================
 N_FFT       = 64          # Total OFDM subcarriers
 N_CP        = 16          # Cyclic prefix length
 N_SYMBOLS   = 200         # Total OFDM symbols (training + data)
-N_TRAINING  = 2           # Block-type training symbols (at the beginning)
+N_TRAINING  = 2           # Block-type training symbols (at the beginning). Training symbols are known to the receiver for channel estimation.
 N_DATA_SC   = 52          # Active subcarriers (same as 802.11a: 4 pilots + 48 data)
 N_DATA_SYMS = N_SYMBOLS - N_TRAINING   # 198 data symbols
-SNR_DB      = 18          # AWGN SNR (dB)
+SNR_DB      = 18          # reference AWGN SNR (dB) — LOS at given distance
+FC          = 2.4e9       # carrier frequency (Hz)
+DISTANCE    = 10.0        # TX–RX distance (m) — same for both links
+C_LIGHT     = 3e8         # speed of light (m/s)
 RNG_SEED    = 42
 
 np.random.seed(RNG_SEED)
@@ -95,10 +98,8 @@ def nlos_channel():
 
 
 # ==================== AWGN ====================
-def add_awgn(signal, snr_db):
-    """Add complex AWGN to *signal* at the given SNR (dB)."""
-    sig_pow = np.mean(np.abs(signal) ** 2)
-    noise_pow = sig_pow / (10 ** (snr_db / 10.0))
+def add_awgn(signal, noise_pow):
+    """Add complex AWGN with fixed noise power (common noise floor for all links)."""
     noise = np.sqrt(noise_pow / 2) * (
         np.random.randn(len(signal)) + 1j * np.random.randn(len(signal))
     )
@@ -145,7 +146,7 @@ def estimate_and_equalize(rx_data, tx_training):
 
     # ---- 2. Equalise data symbols ----
     r_data = rx_data[:, N_TRAINING:]                    # (52, 198)
-    rx_eq = r_data / H_est[:, np.newaxis]               # ZF equalisation
+    rx_eq = r_data / H_est[:, np.newaxis]               # ZF equalisation. np.newaxis to broadcast H_est across symbols. H_est now is (52,1)
 
     return rx_eq, H_est
 
@@ -159,6 +160,26 @@ def compute_evm(syms_rx, syms_tx):
 
 # ==================== Main ====================
 def main():
+    
+    # 'ieee' 会自动设置双栏宽度、Times New Roman 字体以及合理的默认字号
+    plt.style.use(['science', 'ieee'])
+
+    # 2. 针对 8pt 规范进行手动微调（SciencePlots 默认可能稍大，这里强制对齐 8pt）
+    plt.rcParams.update({
+        'font.family': 'serif',          # 使用衬线字体 (Times New Roman)
+        'font.serif': ['Times New Roman'],
+        'font.size': 7,                  # 【关键】全局基础字号设为 8pt
+        'axes.labelsize': 7,             # 坐标轴标签大小
+        'axes.titlesize': 7,             # 标题稍微大一点点，但也别超过 9pt
+        'xtick.labelsize': 7,            # X轴刻度数字大小
+        'ytick.labelsize': 7,            # Y轴刻度数字大小
+        'legend.fontsize': 7,            # 图例文字大小
+        'lines.linewidth': 1.2,          # 线宽适中，太粗会显得乱
+        'figure.dpi': 300                # 导出清晰度
+    })
+    plt.rcParams['text.usetex'] = False
+
+
     # ----- 1. Generate data -----
     n_bits_data = N_DATA_SC * N_DATA_SYMS * 2
     n_bits_train = N_DATA_SC * N_TRAINING * 2
@@ -184,13 +205,23 @@ def main():
     sig_tx1, _ = ofdm_modulate(tx_all1)
     sig_tx2, _ = ofdm_modulate(tx_all2)
 
-    # ----- 4. Multipath channel -----
+    # ----- 4. Multipath channel + Path loss -----
     sig_tx1_mp = apply_multipath(sig_tx1, *los_channel())
     sig_tx2_mp = apply_multipath(sig_tx2, *nlos_channel())
 
-    # ----- 5. AWGN -----
-    sig_tx1_mp = add_awgn(sig_tx1_mp, SNR_DB)
-    sig_tx2_mp = add_awgn(sig_tx2_mp, SNR_DB)
+    # Friis free-space path loss (amplitude domain): both links share same distance
+    pl_amp = (4 * np.pi * DISTANCE * FC) / C_LIGHT          # ≈ 1005 @ 2.4 GHz, 10 m
+    sig_tx1_mp /= pl_amp                                     # LOS at 10 m
+    sig_tx2_mp /= pl_amp                                     # NLOS at 10 m
+
+    # ----- 5. AWGN (common noise floor for both links) -----
+    noise_pow = (1.0 / pl_amp ** 2) / (10 ** (SNR_DB / 10.0))
+    sig_tx1_mp = add_awgn(sig_tx1_mp, noise_pow)
+    sig_tx2_mp = add_awgn(sig_tx2_mp, noise_pow)
+
+    # Effective received SNRs
+    snr_rx1 = 10 * np.log10(np.mean(np.abs(sig_tx1_mp) ** 2) / noise_pow)
+    snr_rx2 = 10 * np.log10(np.mean(np.abs(sig_tx2_mp) ** 2) / noise_pow)
 
     # Reshape to per-symbol view
     sym_len = N_FFT + N_CP
@@ -213,13 +244,8 @@ def main():
     ref_pts = np.array([1+1j, -1+1j, -1-1j, 1-1j]) / np.sqrt(2)
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 11))
-    fig.suptitle(
-        f"QPSK + OFDM  |  3-Path Multipath  |  SNR = {SNR_DB} dB  |  "
-        f"{N_DATA_SC} SC × {N_DATA_SYMS} data symbols\n"
-        f"TX1 → RX (LOS  /  3-path with dominant direct ray)    "
-        f"TX2 → RX (NLOS  /  3-path, all reflected)",
-        fontsize=12, fontweight="bold",
-    )
+    fig.suptitle("Constellation of QPSK for LOS and NLOS")
+    
 
     plot_specs = [
         (rx1_raw_data, rx1_eq, data_syms1, "TX1 → RX  (LOS)", axes[0, 0], axes[0, 1]),
@@ -229,7 +255,7 @@ def main():
     for rx_raw, rx_eq, tx_data, title, ax_raw, ax_eq in plot_specs:
         # ---- Raw received (no equalisation) ----
         ax_raw.scatter(rx_raw.real, rx_raw.imag,
-                       s=1.5, alpha=0.5, color="steelblue", edgecolors="none")
+                       s=1.5, alpha=0.5, color="steelblue")
         ax_raw.scatter(ref_pts.real, ref_pts.imag,
                        s=90, marker="X", color="darkred", zorder=5, label="TX reference")
         ax_raw.axhline(0, color="gray", lw=0.5, ls="--")
@@ -260,7 +286,7 @@ def main():
         ax_eq.grid(True, alpha=0.25)
 
     plt.tight_layout(rect=[0, 0, 1, 0.92])
-    out1 = "D:\\work\\wireless sensing\\wifi_csi\\constellation_los_nlos.png"
+    out1 = "constellation_los_nlos.png"
     fig.savefig(out1, dpi=150, bbox_inches="tight")
     plt.show()
     print(f"[1] Constellation diagram  →  {out1}")
@@ -272,8 +298,57 @@ def main():
     rms_nlos = np.std(np.abs(H2_est))
     print(f"    EVM        LOS = {evm_los:.2f}%   |  NLOS = {evm_nlos:.2f}%")
     print(f"    |H| std    LOS = {rms_los:.4f}    |  NLOS = {rms_nlos:.4f}")
+    print(f"    SNR_rx     LOS = {snr_rx1:.2f} dB   |  NLOS = {snr_rx2:.2f} dB")
+    print(f"    Path loss  = {20*np.log10(pl_amp):.1f} dB  (d = {DISTANCE:.0f} m,  fc = {FC/1e9:.1f} GHz)")
+
+    # ==================== Estimated CSI (from LS training) ====================
+    half = N_DATA_SC // 2
+    sc_pos = np.arange(1, half + 1)                   # positive subcarriers:  1 .. 26
+    sc_neg = np.arange(N_FFT - half, N_FFT)            # negative subcarriers: 38 .. 63
+    sc_all = np.concatenate([sc_pos, sc_neg])          # full 52 data subcarrier indices
+
+    # Unwrap phase
+    phase_los  = np.unwrap(np.angle(H1_est))
+    phase_nlos = np.unwrap(np.angle(H2_est))
+
+    fig3, (ax_csi_mag, ax_csi_phase) = plt.subplots(1, 2, figsize=(13, 5))
+    fig3.suptitle("Estimated CSI from Block-Type LS Training Symbols", fontsize=11, fontweight="bold")
+
+    # --- Magnitude (normalised by path loss to recover multipath-only response) ---
+    ax_csi_mag.plot(sc_all, np.abs(H1_est) * pl_amp, "o-", ms=4, lw=1.2,
+                    color="steelblue", label="LOS")
+    ax_csi_mag.plot(sc_all, np.abs(H2_est) * pl_amp, "s-", ms=4, lw=1.2,
+                    color="darkorange", label="NLOS")
+    ax_csi_mag.axhline(1.0, color="gray", lw=0.5, ls="--", label="$|H|=1$ (flat)")
+    ax_csi_mag.axvline(half + 0.5, color="black", lw=0.6, ls=":")
+    ax_csi_mag.set_title("Estimated |H[k]|")
+    ax_csi_mag.set_xlabel("Subcarrier index $k$")
+    ax_csi_mag.set_ylabel("$|\\hat{H}[k]|$")
+    ax_csi_mag.legend()
+    ax_csi_mag.grid(True, alpha=0.3)
+
+    # --- Unwrapped Phase ---
+    ax_csi_phase.plot(sc_all, phase_los, "o-", ms=4, lw=1.2,
+                      color="steelblue", label="LOS")
+    ax_csi_phase.plot(sc_all, phase_nlos, "s-", ms=4, lw=1.2,
+                      color="darkorange", label="NLOS")
+    ax_csi_phase.axhline(0, color="gray", lw=0.5, ls="--")
+    ax_csi_phase.axvline(half + 0.5, color="black", lw=0.6, ls=":")
+    ax_csi_phase.set_title("Estimated $\\angle H[k]$  (unwrapped)")
+    ax_csi_phase.set_xlabel("Subcarrier index $k$")
+    ax_csi_phase.set_ylabel("Phase (rad)")
+    ax_csi_phase.legend()
+    ax_csi_phase.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out3 = "csi_estimated.png"
+    fig3.savefig(out3, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"[3] Estimated CSI          →  {out3}")
 
     # ==================== Channel Frequency Response ====================
+
+
     fig2, (ax_fr, ax_ir) = plt.subplots(1, 2, figsize=(13, 5))
 
     for ax, taps, delays, lbl, color in [
@@ -291,7 +366,7 @@ def main():
         ax.plot(sc_idx, np.abs(H_sc), "o-", ms=4, lw=1.2, color=color)
 
     ax_fr.axhline(1.0, color="gray", lw=0.5, ls="--", label="|H|=1 (flat)")
-    ax_fr.set_title("Channel Magnitude Response |H(f)| on Data Subcarriers", fontsize=12)
+    ax_fr.set_title("Channel Magnitude Response |H(f)| on Data Subcarriers")
     ax_fr.set_xlabel("Subcarrier index k")
     ax_fr.set_ylabel("|H[k]|")
     ax_fr.legend()
@@ -303,7 +378,7 @@ def main():
         taps, delays = ch_fn()
         ax_ir.stem(delays, np.abs(taps), linefmt=colors_ir[lbl],
                    markerfmt="o", basefmt=" ", label=lbl)
-    ax_ir.set_title("Channel Impulse Response (3 Taps)", fontsize=12)
+    ax_ir.set_title("Channel Impulse Response (3 Taps)")
     ax_ir.set_xlabel("Sample delay τ")
     ax_ir.set_ylabel("|h[τ]|")
     ax_ir.legend()
@@ -311,7 +386,7 @@ def main():
     ax_ir.set_xlim(-1, N_CP)
 
     plt.tight_layout()
-    out2 = "D:\\work\\wireless sensing\\wifi_csi\\channel_response.png"
+    out2 = "channel_response.png"
     fig2.savefig(out2, dpi=150, bbox_inches="tight")
     plt.show()
     print(f"[2] Channel response       →  {out2}")
