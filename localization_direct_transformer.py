@@ -1,11 +1,12 @@
 """
-Direct AP-to-Node Localization (no multi-hop)
+Direct AP-to-Node Localization using Transformer model (no multi-hop)
 
 Each node's position is estimated independently using only the CSI
-from AP to that node.  No relay, no propagation of errors across hops.
+from AP to that node.  Uses the TransformerDistAngleConfEstimator
+from train_transformer_dist_angle_conf.py.
 
 Usage:
-    python localization_direct.py
+    python localization_direct_transformer.py
 """
 
 import torch
@@ -16,7 +17,7 @@ import json
 import os
 import time
 
-from train_dnn_dist_angle_conf import DistAngleConfEstimator
+from train_transformer_dist_angle_conf import TransformerDistAngleConfEstimator
 
 
 # ================================================================
@@ -27,27 +28,34 @@ def load_checkpoint(checkpoint_path, device):
     print(f"Loading checkpoint: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    model = DistAngleConfEstimator(
-        ckpt['phase_dim'], ckpt['sincos_dim'],
-        ckpt['hidden_dims_dist'],
-        ckpt['hidden_dims_angle'],
-        ckpt['hidden_dims_conf'],
+    cfg = ckpt['model_config']
+
+    best_str = ""
+    if 'best_val_loss' in ckpt:
+        best_str = f" (best val_loss: {ckpt['best_val_loss']:.4f})"
+    print(f"  Trained for {ckpt.get('epoch', '?')} epochs{best_str}")
+
+    model = TransformerDistAngleConfEstimator(
+        num_subcarriers=cfg['num_subcarriers'],
+        num_rx=cfg['num_rx'],
+        d_model=cfg.get('d_model', 64),
+        nhead=cfg.get('nhead', 4),
+        num_layers=cfg.get('num_layers', 4),
+        dim_feedforward=cfg.get('dim_feedforward', 256),
+        dropout=cfg.get('dropout', 0.1),
+        hidden_dims_head=cfg.get('hidden_dims_head', (128, 64)),
     ).to(device)
-
-    state_dict = ckpt['model_state_dict']
-    if ckpt.get('model_version', 1) < 2:
-        print("  Migrating v1 checkpoint → v2 ...")
-        for key_prefix in ['conf_net.0']:
-            w_key = f'{key_prefix}.weight'
-            if w_key in state_dict:
-                old_w = state_dict[w_key]
-                new_w = torch.cat([old_w, torch.zeros(old_w.shape[0], 1)], dim=1)
-                state_dict[w_key] = new_w
-
-    model.load_state_dict(state_dict)
+    model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
-    return (model,
-            ckpt['phase_dim'], ckpt['sincos_dim'],
+
+    n_phase  = 2 * cfg['num_subcarriers']
+    n_sincos = 2 * (cfg['num_rx'] - 1) * cfg['num_subcarriers']
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Transformer: {n_params:,} params  |  "
+          f"d_model={cfg['d_model']}, layers={cfg['num_layers']}, "
+          f"token_dim={2 + 2 * (cfg['num_rx'] - 1)}")
+
+    return (model, n_phase, n_sincos,
             ckpt['scaler_dist'], ckpt['scaler_sincos'], ckpt['scaler_y'])
 
 
@@ -78,6 +86,7 @@ def featurize_csi(csi_block, n_phase, n_sincos):
 @torch.no_grad()
 def estimate_link(features, model, n_phase, n_sincos,
                   scaler_dist, scaler_sincos, scaler_y, device):
+    """Transformer takes flat input — pass the full vector directly."""
     batch_size = 256
     all_preds = []
     for start in range(0, len(features), batch_size):
@@ -86,7 +95,7 @@ def estimate_link(features, model, n_phase, n_sincos,
         X_phase  = scaler_dist.transform(batch[:, :n_phase]).astype(np.float32)
         X_sincos = scaler_sincos.transform(batch[:, n_phase:]).astype(np.float32)
         xb = torch.from_numpy(np.concatenate([X_phase, X_sincos], axis=1)).to(device).float()
-        pred = model(xb[:, :n_phase], xb[:, n_phase:])
+        pred = model(xb)                                    # flat input for transformer
         all_preds.append(pred.cpu().numpy())
     preds_norm = np.concatenate(all_preds)
     preds = np.zeros_like(preds_norm)
@@ -103,7 +112,7 @@ def main():
     BW = 20
     scene_path = f"CSI_Scene_{BW}MHz_4Rx.npz"
     meta_path  = f"metadata_CSI_Scene_{BW}MHz_4Rx.json"
-    ckpt_path  = f"dnn_checkpoint_dist_angle_conf_{BW}MHz.pth"
+    ckpt_path  = f"transformer_checkpoint_dist_angle_conf_{BW}MHz.pth"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -121,7 +130,7 @@ def main():
     n_packets = 500
 
     print(f"\n{'='*65}")
-    print(f"Direct AP-to-Node Localization  ({n_packets} packets/link)")
+    print(f"Direct AP-to-Node Localization — Transformer  ({n_packets} packets/link)")
     print(f"{'='*65}")
     print(f"\nAP position: ({AP_pos[0]:.1f}, {AP_pos[1]:.1f})\n")
 
@@ -166,8 +175,8 @@ def main():
         print(f"{node_name:<10} ({true_pos[0]:.1f}, {true_pos[1]:.1f}){'':<4} "
               f"({est_pos[0]:.2f}, {est_pos[1]:.2f}){'':<4} "
               f"{true_dist:<8.2f} {d_mean:<8.2f} "
-              f"{true_angle:<8.0f} {a_mean:<8.2f} "
-              f"{err:<8.2f} {c_mean:<8.2f}")
+              f"{true_angle:<8.0f} {a_mean:<8.0f} "
+              f"{err:<8.2f} {c_mean:<8.3f}")
 
     mean_err = np.mean([v['err'] for v in errors.values()])
     print("-" * 90)
@@ -206,7 +215,7 @@ def main():
         ax.annotate("", xy=(est_pos[0], est_pos[1]),
                     xytext=(AP_pos[0], AP_pos[1]),
                     arrowprops=dict(arrowstyle="->", color='#1f77b4', lw=2, alpha=0.7))
-        # Label at midpoint
+        # Error label at midpoint
         mid = (AP_pos + est_pos) / 2
         ax.text(mid[0], mid[1], f"{info['err']:.2f}m", fontsize=7, ha='center',
                 bbox=dict(boxstyle='round,pad=0.1', facecolor='white', alpha=0.8))
@@ -240,7 +249,7 @@ def main():
 
     ax.set_aspect('equal')
     ax.set_xlabel('x (m)'); ax.set_ylabel('y (m)')
-    ax.set_title(f'Direct AP → Node Localization ({BW} MHz)\n'
+    ax.set_title(f'Direct AP → Node Localization — Transformer ({BW} MHz)\n'
                  f'Mean error = {mean_err:.2f} m')
     ax.grid(True, alpha=0.3)
     legend_patches = [
@@ -253,13 +262,13 @@ def main():
                    markeredgecolor='gray', markeredgewidth=2, markersize=8,
                    label='True position'),
     ]
-    ax.legend(handles=legend_patches, loc='lower right', fontsize=8)
+    ax.legend(handles=legend_patches, loc='upper left', fontsize=8)
     plt.tight_layout()
     os.makedirs('scene_figures', exist_ok=True)
-    plt.savefig(f'scene_figures/localization_direct_{BW}MHz.png', dpi=200)
-    plt.savefig(f'scene_figures/localization_direct_{BW}MHz.svg')
+    plt.savefig(f'scene_figures/localization_direct_transformer_{BW}MHz.png', dpi=200)
+    plt.savefig(f'scene_figures/localization_direct_transformer_{BW}MHz.svg')
     plt.show()
-    print(f"\nPlot saved → scene_figures/localization_direct_{BW}MHz.png")
+    print(f"\nPlot saved → scene_figures/localization_direct_transformer_{BW}MHz.png")
 
 
 if __name__ == '__main__':
