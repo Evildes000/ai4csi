@@ -10,19 +10,18 @@ Simulates the floor plan shown in scene.png:
   - Total wall loss = Σ (thickness × attenuation_coefficient) per crossed wall
 
 Scene layout (top-down view, units in meters):
-        y=10 ┌──────────┬────────────┐
-             │          │            │
-             │   AP     │   Node1    │
-     y=5.5   │  (2,7.5) │  (9,7.5)   │
-             ├────thin───┼────medium──┤  ← horizontal wall (thickness varies)
-             │          │            │
-             │   Node2  │   Node3    │
-             │  (3,2.5) │  (9,2.5)   │
-        y=0  └──────────┴────────────┘
-            x=0       x=5.5        x=12
-                  ↑
-            vertical wall
-          (thickness varies)
+            y=100 ┌────────────────────────────┐
+                  │                            │
+                  │           Node5            │
+                  │          (30,55)           │
+                  │    Node4  Node6            │
+             y=50 │───(45,40)─(25,48)wall_1───│
+                  │                            │
+                  │  Node3  Node1              │
+                  │ (65,25) (60,15)            │
+                  │       Node2  AP            │
+             y=0  │      (55,5) (80,0)         │
+                 x=0                          x=100
 
 Signal model: single-path Rayleigh fading + FSPL + wall attenuation + AWGN
 Antenna array: 2×2 rectangular, d = λ/3
@@ -87,17 +86,26 @@ num_packet = 500
 
 
 
-# square of room: 30*30. Original point (0,0) at left bottom corner. Units in meters.
+# square room: 100*100. Origin (0,0) at left-bottom corner. Units in meters.
 
 # ── Nodes ──
 nodes = {
-    'AP':    np.array([8.0,  0.0]),
-    'Node1': np.array([3.0,  3.0]),
-    'Node2': np.array([2.0,  0.0]),
-    'Node3': np.array([7.0,  4.0]),
-    'Node4': np.array([2.5,  7.0]),
-    'Node5': np.array([6.0,  8.0]),
-    'Node6': np.array([8.0,  7.5])
+    'BS':  np.array([50.0,  10.0]),
+    'UE1': np.array([62.0,  28.0]),
+    'UE2': np.array([65.0,  50.0]),
+    'UE3': np.array([80.0,  55.0]),
+    'UE4': np.array([90.0,  40.0]),
+    'UE5': np.array([35.0,  50.0]),
+    'UE6': np.array([25.0,  48.0]),
+    'UE7': np.array([20.0,  30.0]),
+    'UE8': np.array([50.0,  60.0]),
+    'UE9': np.array([70.0,  80.0]),
+    'UE10': np.array([80.0,  90.0]),
+    'UE11': np.array([35.0,  70.0]),
+    'UE12': np.array([30.0,  80.0]),
+    'UE13': np.array([55.0,  30.0]),
+    'UE14': np.array([45.0,  40.0]),
+    'UE15': np.array([62.0,  62.0]),
 }
 
 
@@ -136,38 +144,34 @@ ATTEN_COEFF = 100.0          # dB/m  (generic brick/concrete at 5.8 GHz)
 # ]
 
 
+
+# P1, P2分别是一面墙中线两个断点的坐标，thickness是墙的厚度，label是墙的标签。墙的插入损耗可以通过厚度和衰减系数计算得出。 
 walls = [
 
-    {'label': 'wall_1', 'p1': (0.0, 5.0), 'p2': (5.0, 5.0), 'thickness': 0.50},  # 50dB
-    {'label': 'wall_2', 'p1': (6.0, 7.0), 'p2': (9.0, 7.0), 'thickness': 0.30},  # 30dB
-    {'label': 'wall_3', 'p1': (5.0, 1.0), 'p2': (5.0, 5.0), 'thickness': 0.10},  # 20dB
+    {'label': 'wall_1', 'p1': (40.0, 00.0), 'p2': (40.0, 50.0), 'thickness': 0.30},  # 50dB
+    {'label': 'wall_2', 'p1': (60.0, 00.0), 'p2': (60.0, 50.0), 'thickness': 0.30},  # 30dB
+    {'label': 'wall_3', 'p1': (60.0, 60.0), 'p2': (100.0, 60.0), 'thickness': 0.30},  # 10dB
+    {'label': 'wall_4', 'p1': (00.0, 60.0), 'p2': (40.0, 60.0), 'thickness': 0.30},  # 10dB
+    {'label': 'wall_5', 'p1': (60.0, 65.0), 'p2': (60.0, 100.0), 'thickness': 0.30},  # 10dB
+    {'label': 'wall_6', 'p1': (40.0, 65.0), 'p2': (40.0, 100.0), 'thickness': 0.30},  # 10dB
 
 ]
 
-# ── Links to simulate ──
-links = [
-    ('AP',    'Node1'),
-    ('AP',    'Node2'),
-    ('AP',    'Node3'),
-    ('AP',    'Node4'),
-    ('AP',    'Node5'),
-    ('AP',    'Node6'),
-    ('Node1', 'Node2'),
-    ('Node1', 'Node3'),
-    ('Node1', 'Node4'),
-    ('Node1', 'Node5'),
-    ('Node1', 'Node6'),
-    ('Node2', 'Node3'),
-    ('Node2', 'Node4'),
-    ('Node2', 'Node5'),
-    ('Node2', 'Node6'),
-    ('Node3', 'Node4'),
-    ('Node3', 'Node5'),
-    ('Node3', 'Node6'),
-    ('Node4', 'Node5'),
-    ('Node4', 'Node6'),
-    ('Node5', 'Node6'),
-]
+# ── Links auto-generated from nodes (bidirectional, d ≤ WIFI_RANGE) ──
+WIFI_RANGE = 30.0  # metres
+
+node_names = list(nodes.keys())
+links = []
+for i, a in enumerate(node_names):
+    pa = nodes[a]
+    for b in node_names[i + 1:]:
+        pb = nodes[b]
+        if np.linalg.norm(pa - pb) <= WIFI_RANGE:
+            links.append((a, b))
+            links.append((b, a))
+
+print(f'  Auto-generated {len(links)} links (d <= {WIFI_RANGE}m)')
+
 
 
 
@@ -509,8 +513,8 @@ def main():
                     ha='center', fontsize=10, fontweight='bold')
 
     # ── Styling ──
-    ax.set_xlim(-0.5, 12.5)
-    ax.set_ylim(-0.5, 10.5)
+    ax.set_xlim(-5.0, 105.0)
+    ax.set_ylim(-5.0, 105.0)
     ax.set_aspect('equal')
     ax.set_xlabel('x (m)')
     ax.set_ylabel('y (m)')

@@ -180,9 +180,9 @@ def localize_nodes(scene_data, model, n_phase, n_sincos,
     node_names = list(nodes_true.keys())
 
     # ── State ──
-    flags = {name: (name == 'AP') for name in node_names}          # AP pre-localized
+    flags = {name: (name == 'BS') for name in node_names}          # AP pre-localized
     positions = {name: None for name in node_names}
-    positions['AP'] = nodes_true['AP'].copy()                      # AP knows its own position
+    positions['BS'] = nodes_true['BS'].copy()                      # AP knows its own position
     ip = {name: f"192.168.1.{i+1}" for i, name in enumerate(node_names)}
 
     # ── Build link lookup: (tx, rx) → CSI field name ──
@@ -198,8 +198,8 @@ def localize_nodes(scene_data, model, n_phase, n_sincos,
     print(f"\n{'='*70}")
     print(f"Distributed Localization — {len(node_names)} nodes  ({n_packets} pkts/link)")
     print(f"{'='*70}")
-    print(f"\nInitial state: AP @ ({positions['AP'][0]:.1f}, {positions['AP'][1]:.1f}), "
-          f"IP={ip['AP']}  [flag=1]\n")
+    print(f"\nInitial state: BS @ ({positions['BS'][0]:.1f}, {positions['BS'][1]:.1f}), "
+          f"IP={ip['BS']}  [flag=1]\n")
 
     iteration = 0
     while not all(flags.values()):
@@ -270,31 +270,14 @@ def localize_nodes(scene_data, model, n_phase, n_sincos,
               f"|  Err: {err:.2f} m  [flag=1]")
 
     # ── Summary ──
-    print(f"\n{'='*70}")
-    print(f"Localization complete after {iteration} step(s).")
-    print(f"{'='*70}")
-    print(f"\n{'Node':<10} {'Flag':<6} {'IP':<16} {'Est (x,y)':<20} {'True (x,y)':<20} {'Err (m)':<10}")
-    print("-" * 70)
-    total_err = 0.0
-    for name in node_names:
-        flag = flags[name]
-        est  = positions[name]
-        true = nodes_true[name]
-        if est is not None:
-            err = np.linalg.norm(est - true)
-            total_err += err
-            print(f"{name:<10} {flag!s:<6} {ip[name]:<16} "
-                  f"({est[0]:.1f}, {est[1]:.1f}){'':<10} "
-                  f"({true[0]:.1f}, {true[1]:.1f}){'':<10} "
-                  f"{err:.2f}")
-        else:
-            print(f"{name:<10} {flag!s:<6} {ip[name]:<16} "
-                  f"{'—':<20} ({true[0]:.1f}, {true[1]:.1f}){'':<10} {'N/A'}")
+    total_err = sum(np.linalg.norm(positions[n] - nodes_true[n])
+                    for n in node_names if positions[n] is not None and n != 'BS')
     n_located = sum(flags.values())
-    print(f"\n  Total nodes localized: {n_located}/{len(node_names)}")
+    print(f"\n{'='*70}")
+    print(f"Localization complete: {n_located}/{len(node_names)} nodes ({iteration} steps)")
     if n_located > 1:
-        print(f"  Mean position error:   {total_err / (n_located - 1):.2f} m  "
-              f"(excluding AP)")
+        print(f"Mean position error: {total_err / (n_located - 1):.2f} m  (excluding BS)")
+    print(f"{'='*70}")
 
     return positions, log
 
@@ -305,7 +288,7 @@ def localize_nodes(scene_data, model, n_phase, n_sincos,
 
 def graph_optimize(init_positions, link_dists, link_confs,
                    link_angles=None, angle_weight=1.0,
-                   anchor='AP', verbose=True):
+                   anchor='BS', verbose=True):
     """
     Refine node positions by minimizing discrepancy between Transformer-estimated
     (distance, angle) and those computed from positions.
@@ -408,8 +391,13 @@ def graph_optimize(init_positions, link_dists, link_confs,
 # ================================================================
 
 def visualize_localization(nodes_true, positions, log, walls, BW,
-                           atten_coeff, fc, suffix=""):
-    """Plot true vs estimated node positions with localization order."""
+                           atten_coeff, fc, suffix="",
+                           link_dists=None, link_confs=None):
+    """Plot true vs estimated node positions with localization order.
+    
+    Optionally draws AP signal coverage circles when link_dists and
+    link_confs are provided.
+    """
     fig, ax = plt.subplots(figsize=(10, 8))
 
     # ── Walls ──
@@ -432,21 +420,37 @@ def visualize_localization(nodes_true, positions, log, walls, BW,
                 facecolor='gray', edgecolor='black',
                 linewidth=1.5, alpha=alpha)
 
-    # ── Localization steps (arrows from anchor → target) ──
-    colors = plt.cm.viridis(np.linspace(0.2, 0.9, max(len(log), 1)))
-    for i, (step, target, anchor, conf, d, a, err) in enumerate(log):
-        p_anchor = positions[anchor]
-        p_target = positions[target]
-        ax.annotate("", xy=(p_target[0], p_target[1]),
-                    xytext=(p_anchor[0], p_anchor[1]),
-                    arrowprops=dict(arrowstyle="->", color=colors[i],
-                                    lw=2.0, alpha=0.8))
-        # Step number at midpoint
-        mid = (p_anchor + p_target) / 2
-        ax.text(mid[0], mid[1], str(step), fontsize=8, fontweight='bold',
-                ha='center', va='center',
-                bbox=dict(boxstyle='circle,pad=0.1', facecolor='white',
-                          edgecolor=colors[i], alpha=0.9))
+    # ── AP signal coverage circles ──
+    if link_dists is not None and link_confs is not None:
+        ap_pos = positions.get('BS')
+        if ap_pos is not None:
+            ap_dists = []
+            ap_confs = []
+            for (tx, rx), d in link_dists.items():
+                if tx == 'BS' or rx == 'BS':
+                    ap_dists.append(d)
+                    ap_confs.append(link_confs.get((tx, rx), 0.5))
+
+            if ap_dists:
+                max_dist = max(ap_dists)
+                mean_conf = float(np.mean(ap_confs)) if ap_confs else 1.0
+
+                # ── Filled coverage zone (max range, very transparent) ──
+                coverage_circle = plt.Circle(
+                    (ap_pos[0], ap_pos[1]), max_dist,
+                    facecolor='dodgerblue', edgecolor='dodgerblue',
+                    linewidth=1.5, linestyle='--', alpha=0.08, zorder=1,
+                )
+                ax.add_patch(coverage_circle)
+
+                # ── Individual distance rings ──
+                for dist in sorted(set(ap_dists)):
+                    ring = plt.Circle(
+                        (ap_pos[0], ap_pos[1]), dist,
+                        facecolor='none', edgecolor='dodgerblue',
+                        linewidth=0.8, linestyle=':', alpha=0.5, zorder=1,
+                    )
+                    ax.add_patch(ring)
 
     # ── True positions (hollow markers) ──
     for name, pos in nodes_true.items():
@@ -455,21 +459,52 @@ def visualize_localization(nodes_true, positions, log, walls, BW,
                    linewidths=2, linestyle='--', zorder=4)
 
     # ── Estimated positions (filled markers) ──
-    for name, pos in positions.items():
-        if pos is not None:
-            if name == 'AP':
-                marker, size, color = 's', 180, '#d62728'
-            else:
-                marker, size, color = 'o', 120, '#1f77b4'
-            ax.scatter(pos[0], pos[1], marker=marker, s=size,
-                       c=color, edgecolors='black', linewidths=1.5, zorder=5)
-            ax.annotate(name, xy=(pos[0], pos[1]),
-                        xytext=(6, 8), textcoords='offset points',
-                        fontsize=9, fontweight='bold')
+    # Per-node label offsets in points (dx, dy); overrides auto-placement.
+    # Uncomment and edit: dx>0=right, dy>0=up.
+    manual_offsets = {
+        # 'BS':   (15, 10),
+        # 'UE1':  (-10, 20),
+        # 'UE2':  (20, -15),
+        'UE8':  (-5, -0),
+        'UE14': (5, 5),
+        'UE5': (5, 5)
+    }
+
+    positioned = [(name, pos) for name, pos in positions.items() if pos is not None]
+    for i, (name, pos) in enumerate(positioned):
+        if name == 'BS':
+            marker, size, color = 's', 180, '#d62728'
+        else:
+            marker, size, color = 'o', 120, '#1f77b4'
+        ax.scatter(pos[0], pos[1], marker=marker, s=size,
+                   c=color, edgecolors='black', linewidths=1.5, zorder=5)
+
+        # Label offset: manual override or auto
+        if name in manual_offsets:
+            dx, dy = manual_offsets[name]
+        else:
+            # Push label away from nearest neighbour
+            min_dist = float('inf')
+            away_dir = np.array([8.0, 6.0])
+            for j, (_, pos2) in enumerate(positioned):
+                if i == j:
+                    continue
+                d = np.linalg.norm(pos - pos2)
+                if d < min_dist:
+                    min_dist = d
+                    away_dir = pos - pos2
+            norm = np.linalg.norm(away_dir)
+            if norm > 1e-6:
+                away_dir = away_dir / norm * 25.0
+            dx, dy = away_dir[0], away_dir[1]
+
+        ax.annotate(name, xy=(pos[0], pos[1]),
+                    xytext=(dx, dy), textcoords='offset points',
+                    fontsize=9, fontweight='bold')
 
     # ── Connect true → estimated with dashed line ──
     for name in nodes_true:
-        if positions.get(name) is not None and name != 'AP':
+        if positions.get(name) is not None and name != 'BS':
             t = nodes_true[name]
             e = positions[name]
             ax.plot([t[0], e[0]], [t[1], e[1]], 'r:', linewidth=1.0, alpha=0.5)
@@ -486,13 +521,21 @@ def visualize_localization(nodes_true, positions, log, walls, BW,
     legend_patches = [
         mpatches.Patch(color='gray', alpha=0.5, label='Wall'),
         plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='#d62728',
-                   markersize=10, label='AP (known)'),
+                   markersize=10, label='BS (known)'),
         plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#1f77b4',
                    markersize=10, label='Node (estimated)'),
         plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='none',
                    markeredgecolor='gray', markeredgewidth=2, markersize=10,
                    label='Node (true)'),
     ]
+    # AP coverage legend entry (shown when coverage data is available)
+    if link_dists is not None and positions.get('BS') is not None:
+        ap_dists_exist = any(tx == 'BS' or rx == 'BS' for (tx, rx) in link_dists)
+        if ap_dists_exist:
+            legend_patches.append(
+                mpatches.Patch(facecolor='dodgerblue', edgecolor='dodgerblue',
+                               alpha=0.15, label='AP coverage'),
+            )
     ax.legend(handles=legend_patches, loc='upper left', fontsize=8)
 
     plt.tight_layout()
@@ -580,13 +623,15 @@ def main():
 
     # ── Graph optimization ──
     opt_positions = graph_optimize(positions, link_dists_los, link_confs_los,
-                                    link_angles=link_angles_los, anchor="AP")
+                                    link_angles=link_angles_los, anchor="BS")
 
-    # ── Compare: sequential vs optimized ──
+    # ── Final Results Table ──
     node_names = sorted(nodes_true.keys())
-    print(f"{'Node':<10} {'True (x,y)':<16} {'Sequential':<16} "
-          f"{'Err(m)':<8} {'Optimized':<16} {'Err(m)':<8} {'Δ(m)':<8}")
-    print("-" * 85)
+    sep = "─" * 90
+    print(f"\n  Final Results")
+    print(f"  {sep}")
+    print(f"  {'Node':<8} {'True (x,y)':<16} {'Sequential (x,y)':<20} {'Err':<8} {'Optimized (x,y)':<20} {'Err':<8} {'Δ':<8}")
+    print(f"  {sep}")
     seq_errs = []
     opt_errs = []
     for name in node_names:
@@ -599,25 +644,28 @@ def main():
             seq_errs.append(se)
             opt_errs.append(oe)
             delta = se - oe
-            print(f"{name:<10} ({true[0]:.1f}, {true[1]:.1f}){'':<4} "
-                  f"({seq_pos[0]:.2f}, {seq_pos[1]:.2f}){'':<4} "
+            print(f"  {name:<8} ({true[0]:.1f}, {true[1]:.1f}){'':<4} "
+                  f"({seq_pos[0]:.2f}, {seq_pos[1]:.2f}){'':<8} "
                   f"{se:<8.2f} "
-                  f"({opt_pos[0]:.2f}, {opt_pos[1]:.2f}){'':<4} "
+                  f"({opt_pos[0]:.2f}, {opt_pos[1]:.2f}){'':<8} "
                   f"{oe:<8.2f} "
                   f"{delta:<+.2f}")
     mean_seq = np.mean([e for e in seq_errs if e > 0])
     mean_opt = np.mean([e for e in opt_errs if e > 0])
-    print("-" * 85)
-    print(f"{'OVERALL':<10} {'':16} {'':16} {mean_seq:<8.2f} {'':16} "
+    print(f"  {sep}")
+    print(f"  {'MEAN':<8} {'':16} {'':20} {mean_seq:<8.2f} {'':20} "
           f"{mean_opt:<8.2f} {mean_seq-mean_opt:<+.2f}")
+    print(f"  {sep}\n")
 
     # ── Visualize: sequential (before optimization) ──
     visualize_localization(nodes_true, positions, log, walls, BW,
-                           atten_coeff, fc, suffix='_sequential')
+                           atten_coeff, fc, suffix='_sequential',
+                           link_dists=link_dists, link_confs=link_confs)
 
     # ── Visualize: optimized (after graph optimization) ──
     visualize_localization(nodes_true, opt_positions, log, walls, BW,
-                           atten_coeff, fc, suffix='_optimized')
+                           atten_coeff, fc, suffix='_optimized',
+                           link_dists=link_dists_los, link_confs=link_confs_los)
 
 
 if __name__ == '__main__':
