@@ -526,16 +526,18 @@ def main():
     legend_patches = [
         mpatches.Patch(color='gray', alpha=0.5, label='Wall (thickness on label)'),
         plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='#d62728',
-                   markersize=10, label='AP'),
+                   markersize=10, label='BS'),
         plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='#1f77b4',
-                   markersize=10, label='Node'),
+                   markersize=10, label='UE'),
     ]
     ax.legend(handles=legend_patches, loc='lower right', fontsize=8)
 
     plt.tight_layout()
     os.makedirs('scene_figures', exist_ok=True)
-    plt.savefig(f'scene_figures/{output_prefix}_layout.png', dpi=200)
-    plt.savefig(f'scene_figures/{output_prefix}_layout.svg')
+    plt.savefig(f'scene_figures/{output_prefix}_layout.png', dpi=200,
+                bbox_inches='tight', pad_inches=0)
+    plt.savefig(f'scene_figures/{output_prefix}_layout.svg',
+                bbox_inches='tight', pad_inches=0)
     plt.show()
     print(f'  Scene layout saved → scene_figures/{output_prefix}_layout.png')
 

@@ -540,8 +540,10 @@ def visualize_localization(nodes_true, positions, log, walls, BW,
 
     plt.tight_layout()
     os.makedirs('scene_figures', exist_ok=True)
-    plt.savefig(f'scene_figures/localization_transformer_{BW}MHz{suffix}.png', dpi=200)
-    plt.savefig(f'scene_figures/localization_transformer_{BW}MHz{suffix}.svg')
+    plt.savefig(f'scene_figures/localization_transformer_{BW}MHz{suffix}.png', dpi=200,
+                bbox_inches='tight', pad_inches=0)
+    plt.savefig(f'scene_figures/localization_transformer_{BW}MHz{suffix}.svg',
+                bbox_inches='tight', pad_inches=0)
     plt.show()
     print(f"\nLocalization plot saved → scene_figures/localization_transformer_{BW}MHz{suffix}.png")
 
