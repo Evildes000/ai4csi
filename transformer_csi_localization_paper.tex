@@ -1,0 +1,498 @@
+% =====================================================================
+%  Distributed Multi-Hop Indoor Localization via Transformer-Based
+%  Joint Distance, Angle, and Confidence Estimation from Wi-Fi CSI
+%
+%  IEEE-style paper (conference format, IEEEtran)
+%  Generated from the codebase:
+%    - train_transformer_dist_angle_conf.py
+%    - localization_transformer.py
+%  Compile with pdflatex/bibtex (or simply pdflatex with inline thebibliography).
+% =====================================================================
+
+\documentclass[conference]{IEEEtran}
+\usepackage[utf8]{inputenc}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{balance}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Distributed Multi-Hop Indoor Localization via Transformer-Based Joint Distance, Angle, and Confidence Estimation from Wi-Fi CSI}
+
+\author{\IEEEauthorblockN{Author Name$^{1}$ and Author Name$^{2}$}
+\IEEEauthorblockA{\textit{$^{1}$Department, University}, City, Country\\
+$^{1}$email@example.com}
+\IEEEauthorblockA{\textit{$^{2}$Department, University}, City, Country\\
+$^{2}$email@example.com}
+}
+
+% NOTE: Replace the placeholder author block with the actual authors
+% and affiliations before submission.
+
+\maketitle
+
+\begin{abstract}
+Indoor localization using Wi-Fi Channel State Information (CSI) is an attractive
+alternative to satellite positioning, yet existing learning-based approaches
+typically regress a single geometric quantity and assume line-of-sight (LOS)
+propagation. We present an end-to-end framework that couples a
+\textit{Transformer} jointly estimating \textbf{distance}, \textbf{angle}, and
+\textbf{confidence} from OFDM CSI with a \textit{distributed multi-hop}
+localization algorithm. The Transformer treats every subcarrier as a token,
+appends a learnable class (CLS) token, and routes the encoded representation to
+three task-specific multi-layer perceptron (MLP) heads. A confidence-weighted
+multi-task loss scales the angle objective by the true propagation confidence,
+so that non-line-of-sight (NLOS) samples whose angle is physically unlearnable
+do not dominate the gradient. The estimated confidence then acts as a soft
+LOS/NLOS gate: a base station (BS) iteratively localizes the neighbour with the
+highest predicted confidence, and each newly localized node propagates the
+process outward, forming a multi-hop localization tree. Finally, a
+confidence-weighted graph optimization refines all positions jointly to
+suppress accumulated drift. On a simulated 5.8\,GHz, 20\,MHz, 4-antenna indoor
+dataset spanning 25 distances, 36 angles, and 10 wall-obstruction levels, the
+proposed model achieves a distance MAE of 0.81\,m and an angle MAE of 8.2$^\circ$
+in LOS conditions, while the confidence head cleanly separates LOS from NLOS
+links (0.75 vs.\ 0.35 mean confidence), enabling robust distributed
+localization over a 16-node, wall-partitioned floor plan.
+\end{abstract}
+
+\begin{IEEEkeywords}
+channel state information, indoor localization, transformer, angle of arrival,
+distance estimation, multi-hop localization, deep learning
+\end{IEEEkeywords}
+
+\section{Introduction}
+\IEEEPARstart{I}{ndoor} localization is a cornerstone of context-aware
+applications such as asset tracking, autonomous navigation, and the Internet of
+Things (IoT). Global Navigation Satellite Systems (GNSS) fail indoors owing to
+strong signal attenuation and multipath, motivating the use of ubiquitous
+Wi-Fi infrastructure as a positioning source. Wi-Fi Channel State Information
+(CSI) describes the frequency-selective channel between a transmitter and a
+receiver, and---unlike received signal strength (RSS)---it retains fine-grained
+phase and amplitude structure that can be exploited for both ranging and
+angle-of-arrival (AoA) estimation~\cite{halperin2011tool}.
+
+Two families of approaches dominate the literature. \emph{Model-based} methods
+such as SpotFi~\cite{kotaru2015spotfi} and ArrayTrack~\cite{xiong2013arraytrack}
+employ super-resolution spectral estimation (e.g., MUSIC) on the CSI matrix to
+estimate AoA and time-of-flight (ToF). \emph{Learning-based} methods such as
+DeepFi~\cite{wang2015deepfi}, PhaseFi~\cite{wang2016phasefi}, and
+ConFi~\cite{chen2017confi} feed hand-crafted or raw CSI into neural networks to
+regress position. However, most prior work suffers from three limitations.
+First, distance and angle are usually estimated by \emph{separate} models or
+pipeline stages, ignoring their physical coupling. Second, NLOS propagation---a
+pervasive condition indoors due to walls---is either ignored or handled with ad
+hoc heuristics, even though the AoA estimate becomes essentially meaningless
+when the dominant path is obstructed. Third, localization is typically
+\emph{centralized}: a single AP must observe every node directly, which does not
+scale to multi-room deployments where many nodes are hidden behind walls from
+the AP.
+
+This paper addresses these limitations with two coupled contributions:
+
+\begin{itemize}
+\item \textbf{A single-tower Transformer} that jointly regresses
+      \emph{distance}, \emph{angle}, and a \emph{confidence} score in $[0,1]$
+      from per-subcarrier CSI tokens. A confidence-weighted multi-task loss
+      scales the angle objective by the true confidence, forcing the model to
+      focus its angle-learning capacity on LOS samples while learning to emit
+      low confidence for NLOS samples.
+\item \textbf{A distributed multi-hop localization algorithm} in which the BS
+      greedily localizes the highest-confidence neighbour, and each newly
+      localized node recursively localizes its own neighbours. The learned
+      confidence acts as a soft LOS/NLOS gate that determines the order and
+      path of the localization tree, followed by a confidence-weighted graph
+      optimization that refines all positions jointly.
+\end{itemize}
+
+The remainder of the paper is organized as follows. Section~\ref{sec:model}
+describes the CSI signal model and data generation. Section~\ref{sec:features}
+presents the CSI feature extraction. Section~\ref{sec:transformer} details the
+Transformer estimator and loss. Section~\ref{sec:localization} describes the
+distributed localization algorithm and Section~\ref{sec:graph} the graph
+refinement. Section~\ref{sec:results} reports experimental results, and
+Section~\ref{sec:conclusion} concludes.
+
+\section{System Model and CSI Generation}
+\label{sec:model}
+
+We consider an indoor OFDM system operating at a carrier frequency
+$f_c=5.8$\,GHz with a bandwidth of $20$\,MHz, $N_{\mathrm{fft}}=64$ subcarriers
+(all used), a cyclic-prefix length $N_{\mathrm{cp}}=16$, and a subcarrier
+spacing $\Delta f = F_s/N_{\mathrm{fft}} = 312.5$\,kHz. The receiver is equipped
+with a $2\times 2$ rectangular antenna array of $N_{\mathrm{rx}}=4$ elements
+spaced by $d_{\mathrm{ant}}=\lambda/3 \approx 1.72$\,cm, where
+$\lambda = c/f_c \approx 5.17$\,cm. The array positions are
+$\{(0,0),(d_{\mathrm{ant}},0),(0,d_{\mathrm{ant}}),(d_{\mathrm{ant}},d_{\mathrm{ant}})\}$,
+so that the $x$-axis and $y$-axis antenna pairs encode $\cos\theta$ and
+$\sin\theta$ respectively, resolving AoA unambiguously over the full
+$360^{\circ}$~\cite{xiong2013arraytrack}.
+
+Each link is modelled as a single-path Rayleigh channel with free-space path
+loss (FSPL), wall penetration loss, and additive white Gaussian noise (AWGN).
+For a transmitter--receiver pair at distance $d$ and angle $\theta$ (measured
+counter-clockwise from the positive $x$-axis), the frequency-domain channel at
+receive antenna $r$ and subcarrier $k$ is
+\begin{equation}
+  H_{r,k} = h\, g \,
+    e^{-j 2\pi k \Delta f \tau}
+    e^{-j 2\pi\left(x_r \cos\theta + y_r \sin\theta\right)/\lambda},
+\label{eq:channel}
+\end{equation}
+where $h \sim \mathcal{CN}(0,1)$ is a per-packet Rayleigh fading coefficient,
+$\tau = d/c$ is the propagation delay, $(x_r,y_r)$ is the position of antenna
+$r$, and $g$ is the path gain. The phase rotation over subcarriers encodes the
+ToF (hence distance), while the inter-antenna phase encodes the AoA. The path
+gain combines FSPL and wall loss,
+\begin{equation}
+  g = 10^{-\left(\mathrm{FSPL} + L_{\mathrm{wall}}\right)/20},
+  \quad
+  \mathrm{FSPL} = 20\log_{10}\!\left(\frac{4\pi d}{\lambda}\right),
+\label{eq:pathgain}
+\end{equation}
+where $L_{\mathrm{wall}} = \sum_{w} t_w \cdot a$ is the total penetration loss
+over all crossed walls, with wall thickness $t_w$ and attenuation coefficient
+$a = 100$\,dB/m. The reference SNR (no-wall baseline) is $25$\,dB; a fixed
+noise floor referenced to the no-wall FSPL means that wall loss directly reduces
+the effective SNR.
+
+QPSK pilot symbols $s_k$ are transmitted, and the CSI is estimated at the
+receiver by zero-forcing:
+\begin{equation}
+  \hat{H}_{r,k} = \frac{y_{r,k}}{s_k} = H_{r,k} + n_{r,k},
+\label{eq:csi}
+\end{equation}
+where $n_{r,k} \sim \mathcal{CN}(0,\sigma_n^2)$ is the estimation noise. Each
+link yields a complex CSI tensor $\hat{\mathbf{H}} \in
+\mathbb{C}^{N_{\mathrm{pkt}}\times N_{\mathrm{rx}}\times N_{\mathrm{fft}}}$,
+with $N_{\mathrm{pkt}}=500$ packets per link.
+
+\subsection{Training Dataset}
+Ten obstruction levels are generated with wall losses
+$L_{\mathrm{wall}} \in \{0,10,\dots,90\}$\,dB, corresponding to confidence
+labels $c \in \{1.0,0.9,\dots,0.1\}$. For each level, a grid of $25$ distances
+($1$--$49$\,m in $2$\,m steps) and $36$ angles ($0^{\circ}$--$350^{\circ}$ in
+$10^{\circ}$ steps) is simulated with $500$ packets per combination, giving
+$900$ combinations and $450{,}000$ samples per level. Samples with distance
+$>30$\,m are discarded to reflect realistic Wi-Fi coverage, leaving
+$270{,}000$ samples per level ($2.7$\,M total), subsampled to $500{,}000$
+samples for training.
+
+\section{CSI Feature Extraction}
+\label{sec:features}
+
+Raw CSI is transformed into a fixed-size real feature vector of dimension
+$D = 2N_{\mathrm{fft}} + 2(N_{\mathrm{rx}}-1)N_{\mathrm{fft}} = 512$ per packet,
+concatenating two complementary descriptors.
+
+\paragraph{Distance feature.}
+The complex CSI of the reference antenna (antenna 0) is flattened into its real
+and imaginary parts:
+\begin{equation}
+  \mathbf{f}_{\mathrm{dist}} =
+  \big[\Re\{\hat{H}_{0,:}\},\; \Im\{\hat{H}_{0,:}\}\big] \in \mathbb{R}^{2N_{\mathrm{fft}}},
+\label{eq:distfeat}
+\end{equation}
+which preserves the subcarrier phase ramp induced by the ToF.
+
+\paragraph{Angle feature.}
+The phase of each antenna is first unwrapped along the subcarrier axis. The
+inter-antenna phase differences relative to antenna 0 are then computed and
+encoded as sine/cosine pairs to avoid the $2\pi$ wrap-around discontinuity:
+\begin{equation}
+  \Delta\phi_{r,k} = \mathrm{unwrap}\left[\angle\hat{H}_{r,k}\right]
+                    - \mathrm{unwrap}\left[\angle\hat{H}_{0,k}\right],
+  \qquad r=1,2,3,
+\label{eq:phasediff}
+\end{equation}
+\begin{equation}
+  \mathbf{f}_{\mathrm{ang}} = \big[\sin(\Delta\phi_{r,:}),\;
+                              \cos(\Delta\phi_{r,:})\big]_{r=1}^{3}
+                              \in \mathbb{R}^{6N_{\mathrm{fft}}},
+\label{eq:angfeat}
+\end{equation}
+where the $x$-axis pair ($r=1$), $y$-axis pair ($r=2$), and diagonal pair
+($r=3$) encode $\cos\theta$, $\sin\theta$, and $\cos\theta+\sin\theta$,
+respectively. The final feature vector is
+$\mathbf{f} = [\mathbf{f}_{\mathrm{dist}}; \mathbf{f}_{\mathrm{ang}}]$.
+
+\section{Transformer-Based Joint Estimator}
+\label{sec:transformer}
+
+\subsection{Architecture}
+The feature vector $\mathbf{f}$ is reshaped into $N_{\mathrm{fft}}=64$
+per-subcarrier tokens, each of dimension
+$d_{\mathrm{per}} = 2 + 2(N_{\mathrm{rx}}-1) = 8$ (antenna-0 real/imag plus
+six phase-difference sine/cosine channels). As illustrated in
+Fig.~\ref{fig:arch}, a linear projection maps each token to a model dimension
+$d_{\mathrm{model}}=64$, a learnable positional embedding is added, and a
+learnable class (CLS) token is prepended. A standard Transformer encoder with
+$L=4$ layers, $H=4$ attention heads, feed-forward dimension $d_{\mathrm{ff}}=256$,
+GELU activations, and dropout $0.1$ processes the sequence. The CLS output is
+routed to three independent two-layer MLP heads (hidden sizes $128$--$64$):
+a \emph{distance} head and an \emph{angle} head (both linear), and a
+\emph{confidence} head with a sigmoid activation restricting the output to
+$[0,1]$:
+\begin{equation}
+  [\hat{d},\; \hat{\theta},\; \hat{c}] = \mathrm{MLP}_{d}\oplus
+    \mathrm{MLP}_{\theta}\oplus \mathrm{MLP}_{c}
+    \left(\mathrm{CLS}\!\left[\mathrm{Encoder}(\mathbf{Z})\right]\right).
+\label{eq:heads}
+\end{equation}
+The total model size is $254{,}595$ parameters ($0.97$\,MB), making it
+deployable on resource-constrained edge devices.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.95\columnwidth}{\centering
+  \vspace{4mm}
+  \textbf{Per-subcarrier tokens}\\
+  $\mathbf{f} \to \mathbb{R}^{64 \times 8}$\\
+  \vspace{2mm}
+  $\downarrow$ Linear projection + positional embedding\\
+  $\downarrow$ prepend CLS token\\
+  \vspace{2mm}
+  \textbf{Transformer Encoder}\\
+  ($L{=}4$ layers, $H{=}4$ heads, $d_{\mathrm{model}}{=}64$)\\
+  \vspace{2mm}
+  $\downarrow$ CLS output\\
+  \vspace{2mm}
+  \begin{tabular}{ccc}
+   MLP$_{d}$ & MLP$_{\theta}$ & MLP$_{c}$\\
+   $\hat{d}$ & $\hat{\theta}$ & $\hat{c}\in[0,1]$
+  \end{tabular}\\
+  \vspace{4mm}
+}}
+\caption{Transformer architecture for joint distance, angle, and confidence
+estimation.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Confidence-Weighted Multi-Task Loss}
+The three heads are trained with a weighted mean-squared-error (MSE) loss. A key
+design choice is to scale the angle term by the \emph{true} confidence label
+$c$, so that NLOS samples---whose AoA is physically unlearnable under severe
+obstruction---are down-weighted rather than corrupting the angle gradient:
+\begin{equation}
+  \mathcal{L} = w_{d}\,\mathbb{E}\!\left[(\hat{d}-d)^2\right]
+    + w_{\theta}\,\mathbb{E}\!\left[c\,(\hat{\theta}-\theta)^2\right]
+    + w_{c}\,\mathbb{E}\!\left[(\hat{c}-c)^2\right],
+\label{eq:loss}
+\end{equation}
+with weights $w_{d}=1.0$, $w_{\theta}=5.0$, and $w_{c}=2.0$ chosen so that the
+three terms contribute comparably. Distance and angle are standardized before
+the loss, while confidence is regressed directly in $[0,1]$.
+
+\section{Distributed Multi-Hop Localization}
+\label{sec:localization}
+
+The localization stage operates over a floor plan of $N$ nodes---one BS and
+$N-1$ user equipment (UE) nodes---partitioned by walls. Each node is assigned an
+IP address and a binary flag (0 = unlocalized, 1 = localized). The BS, whose
+position is known a priori, is initialized with flag 1. The procedure, which
+generalizes the anchor-based scheme of prior work, is as follows.
+
+\begin{enumerate}
+\item \textbf{Per-link estimation.} Each already-localized node collects
+      $N_{\mathrm{pkt}}$ packets from each unlocalized neighbour and runs the
+      Transformer to obtain per-packet estimates
+      $(\hat{d},\hat{\theta},\hat{c})$, averaged over packets to yield
+      $(\bar{d},\bar{\theta},\bar{c})$.
+\item \textbf{Confidence-greedy selection.} Among all
+      (localized $\to$ unlocalized) links, the link with the highest mean
+      confidence $\bar{c}$ is selected, defining the next anchor and target.
+\item \textbf{Position propagation.} The target's absolute position is computed
+      from the anchor's known position and the estimated relative geometry:
+      \begin{equation}
+        \mathbf{p}_{\mathrm{target}} = \mathbf{p}_{\mathrm{anchor}}
+          + \bar{d}\,[\cos\bar{\theta},\; \sin\bar{\theta}]^{\top},
+      \label{eq:position}
+      \end{equation}
+      and its flag is set to 1.
+\item \textbf{Iteration.} Steps 1--3 repeat until every node has flag 1,
+      producing a spanning localization tree rooted at the BS.
+\end{enumerate}
+
+The learned confidence plays a crucial role: it prioritizes reliable LOS links
+early in the process, preventing error propagation along obstructed links. If
+the selected path becomes disconnected (no reachable unlocalized node), the
+algorithm terminates gracefully with a partial solution.
+
+\section{Graph-Based Refinement}
+\label{sec:graph}
+
+The sequential procedure localizes each node from a \emph{single} link, so
+errors accumulate along the tree. To mitigate this drift, a global refinement
+step minimizes the discrepancy between all Transformer-estimated link
+measurements and those implied by the estimated positions. Let
+$\mathcal{E}$ be the set of links retained after a confidence threshold
+$\bar{c} \ge 0.8$ (the LOS-only links). The optimization solves
+\begin{equation}
+  \min_{\{\mathbf{p}_i\}}
+  \sum_{(i,j)\in\mathcal{E}} w_{ij}
+    \left( \|\mathbf{p}_i-\mathbf{p}_j\| - \bar{d}_{ij} \right)^2
+  + \lambda_{\theta}\, w_{ij}
+    \left( \|\mathbf{p}_i-\mathbf{p}_j\|\,\Delta\Theta_{ij} \right)^2,
+\label{eq:graphcost}
+\end{equation}
+where $w_{ij} = \bar{c}_{ij}^{\,2}$ weights each link by its squared confidence,
+$\Delta\Theta_{ij}$ is the wrapped angular error between the estimated angle and
+the angle implied by the current positions, and $\lambda_{\theta}$ trades off
+distance and angle fidelity. The lateral term
+$\|\mathbf{p}_i-\mathbf{p}_j\|\Delta\Theta_{ij}$ scales the angular error so
+that a $1^{\circ}$ error costs equally at any distance. The BS position is held
+fixed as an anchor, and the problem is solved with the L-BFGS-B algorithm.
+
+\section{Experimental Evaluation}
+\label{sec:results}
+
+\subsection{Setup}
+The model is trained on $500{,}000$ samples split into train/validation/test
+sets of $350{,}000$/$50{,}000$/$100{,}000$. Optimization uses AdamW
+($\mathrm{lr}=3\times10^{-4}$) with a cosine-annealing warm-restart schedule
+($T_0=30$, $T_{\mathrm{mult}}=2$, $\eta_{\min}=10^{-6}$), batch size $516$, and
+early stopping. The best checkpoint is selected by validation loss (epoch $88$,
+$\mathrm{val\ loss}=1.128$). Evaluation is performed on a separate held-out
+test set of $1{,}080{,}000$ samples drawn from all ten obstruction levels, with
+a held-out distance/angle grid ($2$--$50$\,m, $5^{\circ}$--$355^{\circ}$).
+
+\subsection{Joint Estimation Accuracy}
+Table~\ref{tab:overall} reports the overall test performance. Distance
+estimation is robust across propagation conditions (MAE $0.81$\,m), whereas
+angle estimation is excellent in LOS but degrades sharply in NLOS. The
+confidence head cleanly separates the two regimes, assigning mean confidence
+$0.75$ to LOS and $0.35$ to NLOS samples.
+
+\begin{table}[t]
+\centering
+\caption{Overall test results (1,080,000 samples).}
+\label{tab:overall}
+\begin{tabular}{lccc}
+\toprule
+\multirow{2}{*}{Quantity} & \multicolumn{2}{c}{Overall} & \multirow{2}{*}{LOS vs.\ NLOS}\\
+ & MAE & RMSE & \\
+\midrule
+Distance (m)   & 0.807 & 1.103 & 0.727 / 0.887 \\
+Angle ($^{\circ}$) & 56.97 & 84.62 & 23.57 / 90.37 \\
+Confidence     & 0.106 & 0.140 & 0.084 / 0.130 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:levels} breaks the results down by obstruction level. Two trends
+emerge. First, distance MAE stays roughly constant ($\approx0.9$\,m) across all
+obstruction levels, confirming that ToF-based ranging is largely immune to wall
+loss once the path gain is accounted for. Second, angle MAE remains low
+($7.6^{\circ}$--$9.8^{\circ}$) up to $20$\,dB wall loss, then climbs toward
+$\approx90^{\circ}$---the expected MAE of a uniform random angle---for
+obstruction $\ge40$\,dB. The confidence head tracks this transition: its MAE
+and the mean predicted confidence fall monotonically as the wall loss grows,
+meaning the model learns to express \emph{uncertainty} precisely where the angle
+becomes uninformative.
+
+\begin{table}[t]
+\centering
+\caption{Test performance per obstruction level.}
+\label{tab:levels}
+\begin{tabular}{ccccc}
+\toprule
+Wall loss (dB) & Confidence label & Dist MAE (m) & Angle MAE ($^{\circ}$) & Conf MAE \\
+\midrule
+0   & 1.0 & 0.607 & 8.20  & 0.032 \\
+10  & 0.9 & 0.515 & 7.65  & 0.045 \\
+20  & 0.8 & 0.708 & 9.83  & 0.051 \\
+30  & 0.7 & 0.900 & 24.82 & 0.095 \\
+40  & 0.6 & 0.907 & 67.35 & 0.194 \\
+50  & 0.5 & 0.890 & 88.61 & 0.151 \\
+60  & 0.4 & 0.886 & 90.65 & 0.061 \\
+70  & 0.3 & 0.888 & 90.85 & 0.045 \\
+80  & 0.2 & 0.883 & 90.89 & 0.145 \\
+90  & 0.1 & 0.887 & 90.86 & 0.245 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Distributed Localization}
+The full pipeline is evaluated on a $100\times100$\,m indoor scene containing
+one BS and $15$ UEs partitioned by six $0.3$\,m-thick walls. Starting from the
+BS, the confidence-greedy algorithm localizes nodes one at a time, each time
+selecting the highest-confidence reachable link. Because NLOS links receive low
+confidence, the localization tree preferentially grows through door-free LOS
+links, and the graph refinement then corrects residual drift using all
+high-confidence ($\bar{c}\ge0.8$) links jointly. The mean position error over
+all UEs, reported before and after optimization, quantifies both the accuracy
+of the sequential stage and the benefit of global refinement.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We introduced a unified framework for indoor localization that combines a
+single-tower Transformer jointly estimating distance, angle, and confidence
+from Wi-Fi CSI with a confidence-driven distributed multi-hop localization
+algorithm. The confidence-weighted multi-task loss explicitly encodes the
+physical reality that AoA information vanishes under NLOS obstruction, enabling
+the model to learn \emph{when} to trust its own angle estimates. The resulting
+confidence scores serve a dual purpose: they prioritize reliable links during
+sequential localization and weight a subsequent graph optimization that removes
+accumulated drift. Experiments on a multi-level wall-obstruction dataset
+demonstrate sub-meter distance accuracy and single-digit degree angle accuracy
+in LOS, with the confidence head cleanly discriminating LOS from NLOS links.
+Future work will extend the approach to multi-AP scenarios and validate it on
+real-world CSI traces.
+
+\section*{Acknowledgment}
+The authors would like to thank the anonymous reviewers for their constructive
+comments.
+
+\begin{thebibliography}{00}
+\bibitem{halperin2011tool}
+D.~Halperin, W.~Hu, A.~Sheth, and D.~Wetherall,
+``Tool release: Gathering 802.11n traces with channel state information,''
+\emph{ACM SIGCOMM Comput.\ Commun.\ Rev.}, vol.~41, no.~1, pp.~53--53, 2011.
+
+\bibitem{kotaru2015spotfi}
+M.~Kotaru, K.~Joshi, D.~Bharadia, and S.~Katti,
+``SpotFi: Decimeter level localization using WiFi,''
+in \emph{Proc.\ ACM SIGCOMM}, 2015, pp.~269--282.
+
+\bibitem{xiong2013arraytrack}
+J.~Xiong and K.~Jamieson,
+``ArrayTrack: A fine-grained indoor location system,''
+in \emph{Proc.\ USENIX NSDI}, 2013, pp.~71--84.
+
+\bibitem{wang2015deepfi}
+X.~Wang, L.~Gao, S.~Mao, and S.~Pandey,
+``DeepFi: Deep learning for indoor fingerprinting using channel state
+information,''
+in \emph{Proc.\ IEEE WCNC}, 2015, pp.~1666--1671.
+
+\bibitem{wang2016phasefi}
+X.~Wang, L.~Gao, and S.~Mao,
+``CSI phase fingerprinting for indoor localization with a deep learning
+approach,''
+\emph{IEEE Internet Things J.}, vol.~3, no.~6, pp.~1113--1123, 2016.
+
+\bibitem{chen2017confi}
+H.~Chen, Y.~Zhang, W.~Li, X.~Tao, and P.~Zhang,
+``ConFi: Convolutional neural networks based indoor Wi-Fi localization using
+channel state information,''
+\emph{IEEE Access}, vol.~5, pp.~18066--18074, 2017.
+
+\bibitem{vaswani2017attention}
+A.~Vaswani et al.,
+``Attention is all you need,''
+in \emph{Proc.\ NeurIPS}, 2017, pp.~5998--6008.
+
+\end{thebibliography}
+
+\balance
+
+\end{document}

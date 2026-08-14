@@ -512,7 +512,7 @@ def test_dist_angle_conf(bw: int, checkpoint_path: str):
     print(f"  Total samples:  {total_samples:,}")
     print(f"  Preprocess:     {total_preprocess_time:.1f} s")
     print(f"  Inference:      {total_inference_time:.1f} s "
-          f"({total_inference_time / total_samples * 1e6:.1f} µs/sample)")
+          f"({total_inference_time / total_samples * 1e6:.1f} us/sample)")
     print_metrics("OVERALL", overall_m)
 
     # ── LOS vs NLOS breakdown ──
